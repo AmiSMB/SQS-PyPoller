@@ -9,113 +9,198 @@
 # www.dome9.com - secure your cloud
 # ******************************************************************************
 
-import boto
+import boto3
+from botocore.exceptions import ClientError
 import json
 import time
 import sys
 import socket
-import ConfigParser
+from configparser import ConfigParser
 import logging
+import logging.handlers
 from datetime import datetime
-from boto.sqs.message import RawMessage
 
 logger = logging.getLogger('poller')
 
+
 def run():
-    print "starting SQS poller script"
-    forever= any("forever" in s for s in sys.argv)
-    if forever: print "running forever "
+    """
+    Main function
+
+    :return:
+    """
+    print("starting SQS poller script")
+
+    """
+    Check if we have been asked to run forever via command line
+    """
+    forever = any("forever" in s for s in sys.argv)
+
     start = datetime.now()
-    MAX_WORKER_UPTIME_SECONDS = 60 #when not running forever...
-    
+
     # load config file
-    config = ConfigParser.ConfigParser()
+    config = ConfigParser()
     config.read("./poller.conf")
-    
+
     # Set up logging
     logger.setLevel(logging.DEBUG)
     formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
-    
-    if config.getboolean('console','enabled'):
-        consoleHdlr = logging.StreamHandler(sys.stdout)
-        consoleHdlr.setLevel(logging.DEBUG)
-        logger.addHandler(consoleHdlr) 
-    
-    if config.getboolean('file_logger','enabled'):
-        logPath = config.get('file_logger','logPath')
-        hdlr = logging.FileHandler(logPath)
+
+    if config.getboolean('console', 'enabled'):
+        console_hdlr = logging.StreamHandler(sys.stdout)
+        console_hdlr.setLevel(logging.DEBUG)
+        logger.addHandler(console_hdlr)
+
+    if config.getboolean('file_logger', 'enabled'):
+        log_path = config.get('file_logger', 'logPath')
+        hdlr = logging.FileHandler(log_path)
         hdlr.setFormatter(formatter)
         hdlr.setLevel(logging.INFO)
         logger.addHandler(hdlr)
-    
-    if config.getboolean('syslog','enabled'):
+
+    if config.getboolean('syslog', 'enabled'):
         host = config.get('syslog', 'host')
-        port = config.getint('syslog','port')
-        syslogHdlr = logging.handlers.SysLogHandler(address=(host,port), socktype=socket.SOCK_DGRAM)
-        syslogHdlr.setFormatter(formatter)
-        syslogHdlr.setLevel(logging.INFO)
-        logger.addHandler(syslogHdlr) 
-    
+        port = config.getint('syslog', 'port')
+        syslog_hdlr = logging.handlers.SysLogHandler(address=(host, port), socktype=socket.SOCK_DGRAM)
+        syslog_hdlr.setFormatter(formatter)
+        syslog_hdlr.setLevel(logging.INFO)
+        logger.addHandler(syslog_hdlr)
+
+    max_receive_count = 1
+    if config.has_option('poller', 'max_receive_count'):
+        max_receive_count = config.getint('poller', 'max_receive_count')
+
+    max_worker_uptime = 60
+    if config.has_option('poller', 'max_worker_uptime'):
+        max_worker_uptime = config.getint('poller', 'max_worker_uptime')
+        if max_worker_uptime == 0:
+            forever = True
+        else:
+            forever = False
+
+    visibility_timeout = 30
+    if config.has_option('poller', 'visibility_timeout'):
+        visibility_timeout = config.getint('poller', 'visibility_timeout')
+
+    max_number_of_messages = 10
+    if config.has_option('poller', 'max_number_of_messages'):
+        max_number_of_messages = config.getint('poller', 'max_number_of_messages')
+
+    if config.has_option('poller', 'wait_time'):
+        wait_time = config.getint('poller', 'wait_time')
+    else:
+        wait_time = max_worker_uptime
+
+    if wait_time > 20:
+        wait_time = 20
+
+    if forever:
+        print("running forever ")
+
     # Init AWS SQS
-    AWSKey = config.get('aws', 'key')
-    AWSSecret = config.get('aws','secret')
-    queueName = config.get('aws', 'queue_name')
-    queueRegion = config.get('aws', 'region')
-    sqs = boto.sqs.connect_to_region(queueRegion, aws_access_key_id=AWSKey, aws_secret_access_key=AWSSecret)
-    
-    # TODO - proper error handling. Probably faulty IAM configuration
-    q = sqs.get_queue(queueName)
-    if  not q: # fallback for some IAM configurations. see: https://github.com/boto/boto/issues/653
-        logger.debug("could not get Q by name, will try to search all queues")
-        all_queues = sqs.get_all_queues()
-        logger.debug(all_queues)
-        q = [q for q in all_queues if queueName in q.name][0]
-    
-    q.set_message_class(RawMessage)
-    
+    aws_key = config.get('aws', 'key')
+    aws_secret = config.get('aws', 'secret')
+    queue_name = config.get('aws', 'queue_name')
+    queue_region = config.get('aws', 'region')
+    sqs = boto3.client('sqs', region_name=queue_region)
+
     # Poll messages loop
     while True:
-        result_count = 0
+        message_count = 0
         try:
-            results = q.get_messages(10, wait_time_seconds=20)
-            result_count = len(results)
-            logger.debug( "Got %s result(s) this time." % result_count)
-    
-            for result in results:
+            response = sqs.receive_message(
+                QueueUrl=queue_name,
+                MaxNumberOfMessages=max_number_of_messages,
+                WaitTimeSeconds=wait_time,
+                AttributeNames=['All']
+            )
+
+            if 'Messages' in response:
+                messages = response['Messages']
+            else:
+                messages = list()
+
+            message_count = len(messages)
+            logger.debug("Got %s message(s) this time." % message_count)
+
+            for message in messages:
+                message_handled = False
+
                 try:
-                    handleMessage(result)
-                    #result.delete()
-                except:
-                    logger.exception("Error while handling messge:\n{}'".format(result.get_body()))
+                    message_handled = handle_message(message)
+
+                except Exception as e:
+                    error_message = "Error {} while handling message:\n{}'".format(
+                        str(e),
+                        message.get('Body')
+                    )
+                    logger.exception(error_message)
+
                 finally:
-                    result.delete() #this will delete all messages even if their handling failed. For additional reliability you can move this to the try block. (and then configure dead letter queue to handle 'poisonous messages')
-            
-            #if not forever and len(results) == 0:
-            #    break
-        except (socket.gaierror):
+                    # This will hand the message back or delete if not handled after 5 attempts
+                    if message_handled is False:
+                        if int(message['Attributes']['ApproximateReceiveCount']) == max_receive_count:
+                            error_message = "Deleting message after {} retries".format(
+                                message['Attributes']['ApproximateReceiveCount']
+                            )
+                            logger.error(error_message)
+                            message_handled = True
+
+                    if message_handled is False:
+                        sqs.change_message_visibility(
+                            QueueUrl=queue_name,
+                            ReceiptHandle=message['ReceiptHandle'],
+                            VisibilityTimeout=visibility_timeout
+                        )
+                    else:
+                        sqs.delete_message(
+                            QueueUrl=queue_name,
+                            ReceiptHandle=message['ReceiptHandle']
+                        )
+
+                if not forever and len(messages) == 0:
+                    break
+
+        except ClientError as e:
+            error_message = "Client error {}".format(str(e))
+            logger.error(error_message)
             time.sleep(30)
-        except:
-            logger.exception("Unexpected error. Will retry in 60 seconds")
+
+        except Exception as e:
+            error_message = "Unexpected error {}. Will retry in 60 seconds".format(str(e))
+            logger.exception(error_message)
             time.sleep(60)
+
         finally:
             if not forever:
-                if (datetime.now()-start).total_seconds() > MAX_WORKER_UPTIME_SECONDS:
+                if (datetime.now() - start).total_seconds() > max_worker_uptime:
                     logger.debug("Worker uptime exceeded. exiting.")
                     break
-                if result_count==0:
+                if message_count == 0:
                     logger.debug("Queue is empty. exiting.")
                     break
 
 
-def handleMessage(result):
-    '''This is the place to handle each message. 
-    This is the place to customize and write specific message handling logic like sending this message to external system
-    or perfroming addiitonal filtering for specific message types.
-    ''' 
-    msg = json.loads(result.get_body())["Message"] # Assuming this is a JSON SQS message received form SNS. AWS SNS can send raw messages so this line is not needed. See:http://docs.aws.amazon.com/sns/latest/dg/SNSMessageAttributes.html
-    #msg = result.get_body() # this is when you are working in RAW mesage mode.
-    logger.info(msg) # this is the default handling - send to the logger
+def handle_message(message):
+    """
+    Handle the message
+
+    :param message:
+    :return:
+    """
+    message_handled = False
+    try:
+        msg = json.loads(message.get('Body'))
+
+        # this is the default handling - send to the logger
+        logger.info(msg)
+        message_handled = True
+
+    except Exception as e:
+        logger.error(str(e))
+
+    return message_handled
 
 
-
-if __name__ == '__main__': run()
+if __name__ == '__main__':
+    run()
